@@ -1,0 +1,27 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: test-inplace
+spec:
+  replicatedJobs:
+    - name: workers
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          backoffLimit: 0
+          template:
+           spec:
+            shareProcessNamespace: true
+            containers:
+            - name: main
+              image: perl:5.34.0
+              command: [ "/bin/bash", "-c", "--" ]
+              args: [ "while true; do echo '.'; sleep 60; done;" ]
+            initContainers:
+            - name: wrapper
+              image: perl:5.34.0
+              restartPolicy: Always
+              command: ["/bin/sh"]
+              args: ["-c", "echo 'w';sleep 60s;exit 1"]
+            restartPolicy: Never
