@@ -44,9 +44,11 @@ const defaultFailurePolicyRuleAction = jobset.RestartJobSet
 // This function is run only when a failed child job has already been found.
 func executeFailurePolicy(ctx context.Context, js *jobset.JobSet, ownedJobs *childJobs, updateStatusOpts *statusUpdateOpts) error {
 	log := ctrl.LoggerFrom(ctx)
-
+	// For all failed jobs, increment the corresponding ReplicatedJob's backoffLimit to track the number of replica failures.
+	// If any ReplicatedJob has failed, execute the JobSet failure policy. Otherwise, mark the failed jobs for deletion.
+	replicatedJobHasFailed := evaluateReplicatedJobFailureFromBackoffLimit(ctx, js, ownedJobs)
 	// If no failure policy is defined, mark the JobSet as failed.
-	if js.Spec.FailurePolicy == nil {
+	if js.Spec.FailurePolicy == nil && replicatedJobHasFailed {
 		// firstFailedJob is only computed if necessary since it is expensive to compute
 		// for JobSets with many child jobs. This is why we don't unconditionally compute
 		// it once at the beginning of the function and share the results between the different
@@ -61,6 +63,11 @@ func executeFailurePolicy(ctx context.Context, js *jobset.JobSet, ownedJobs *chi
 	rules := js.Spec.FailurePolicy.Rules
 	matchingFailurePolicyRule, matchingFailedJob := findFirstFailedPolicyRuleAndJob(ctx, rules, ownedJobs.failed)
 
+	var foundMatchingFailurePolicyRule bool
+	if matchingFailurePolicyRule != nil {
+		foundMatchingFailurePolicyRule = true
+	}
+
 	var failurePolicyRuleAction jobset.FailurePolicyAction
 	if matchingFailurePolicyRule == nil {
 		failurePolicyRuleAction = defaultFailurePolicyRuleAction
@@ -69,12 +76,44 @@ func executeFailurePolicy(ctx context.Context, js *jobset.JobSet, ownedJobs *chi
 		failurePolicyRuleAction = matchingFailurePolicyRule.Action
 	}
 
-	if err := applyFailurePolicyRuleAction(ctx, js, matchingFailedJob, updateStatusOpts, failurePolicyRuleAction); err != nil {
-		log.Error(err, "applying FailurePolicyRuleAction %v", failurePolicyRuleAction)
-		return err
+	if (!replicatedJobHasFailed && foundMatchingFailurePolicyRule) || replicatedJobHasFailed {
+		if err := applyFailurePolicyRuleAction(ctx, js, matchingFailedJob, updateStatusOpts, failurePolicyRuleAction); err != nil {
+			log.Error(err, "applying FailurePolicyRuleAction %v", failurePolicyRuleAction)
+			return err
+		}
 	}
 
 	return nil
+}
+
+// evaluateReplicatedJobBackoffLimit increments the restart attempts of child jobs in the ReplicatedJobStatus and
+// returns whether any ReplicatedJob has failed i.e. if its replicas have restarted the max allowed times.
+func evaluateReplicatedJobFailureFromBackoffLimit(ctx context.Context, js *jobset.JobSet, ownedJobs *childJobs) bool {
+	log := ctrl.LoggerFrom(ctx)
+
+	for _, failedJob := range ownedJobs.failed {
+		parentReplicatedJob, exists := parentReplicatedJobName(failedJob)
+		if exists {
+			for index, replicatedJobStatus := range js.Status.ReplicatedJobsStatus {
+				if replicatedJobStatus.Name == parentReplicatedJob {
+					numRestarts := js.Status.ReplicatedJobsStatus[index].Restarts
+					maxRestarts := js.Spec.ReplicatedJobs[index].BackoffLimit
+					// If number of restart attempts is less than the backoffLimit, increment the number of restart attempts without failing the ReplicatedJob.
+					// Otherwise, fail the ReplicatedJob.
+					if numRestarts < maxRestarts {
+						js.Status.ReplicatedJobsStatus[index].Restarts = numRestarts + 1
+						js.Status.ReplicatedJobsStatus[index].PendingRestart = true
+					} else {
+						return true
+					}
+				}
+			}
+		} else {
+			log.V(2).Info(fmt.Sprintf("The failed job %v does not appear to have a parent replicatedJob.", failedJob.Name))
+		}
+	}
+
+	return false
 }
 
 // findFirstFailedPolicyRuleAndJob returns the first failure policy rule matching a failed child job.
@@ -180,6 +219,29 @@ func anyMatchFound(ctx context.Context, patterns []string, message string) bool 
 
 // failurePolicyRecreateAll triggers a JobSet restart for the next reconcillation loop.
 func failurePolicyRecreateAll(ctx context.Context, js *jobset.JobSet, shouldCountTowardsMax bool, updateStatusOpts *statusUpdateOpts, event *eventParams) {
+	log := ctrl.LoggerFrom(ctx)
+
+	if updateStatusOpts == nil {
+		updateStatusOpts = &statusUpdateOpts{}
+	}
+
+	// Increment JobSet restarts. This will trigger reconciliation and result in deletions
+	// of old jobs not part of the current jobSet run.
+	js.Status.Restarts += 1
+
+	if shouldCountTowardsMax {
+		js.Status.RestartsCountTowardsMax += 1
+	}
+
+	updateStatusOpts.shouldUpdate = true
+
+	// Emit event for each JobSet restarts for observability and debugability.
+	enqueueEvent(updateStatusOpts, event)
+	log.V(2).Info("attempting restart", "restart attempt", js.Status.Restarts)
+}
+
+// failurePolicyRecreateFailedJobs recreates failed jobs without recreating the JobSet.
+func failurePolicyRecreateFailedJobs(ctx context.Context, js *jobset.JobSet, shouldCountTowardsMax bool, updateStatusOpts *statusUpdateOpts, event *eventParams) {
 	log := ctrl.LoggerFrom(ctx)
 
 	if updateStatusOpts == nil {

@@ -111,6 +111,9 @@ func (r *JobSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	log := ctrl.LoggerFrom(ctx).WithValues("jobset", klog.KObj(&js))
+	ctx = ctrl.LoggerInto(ctx, log)
+
 	// Don't reconcile JobSets marked for deletion.
 	if jobSetMarkedForDeletion(&js) {
 		return ctrl.Result{}, nil
@@ -118,6 +121,13 @@ func (r *JobSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// Track JobSet status updates that should be performed at the end of the reconciliation attempt.
 	updateStatusOpts := statusUpdateOpts{}
+
+	// Get Jobs owned by JobSet.
+	ownedJobs, err := r.getChildJobs(ctx, &js)
+	if err != nil {
+		log.Error(err, "getting jobs owned by jobset")
+		return ctrl.Result{}, err
+	}
 
 	// Reconcile the JobSet.
 	result, err := r.reconcile(ctx, &js, &updateStatusOpts)
@@ -144,8 +154,6 @@ func (r *JobSetReconciler) reconcile(ctx context.Context, js *jobset.JobSet, upd
 		log.V(5).Info("Skipping JobSet managed by a different controller", "managed-by", manager)
 		return ctrl.Result{}, nil
 	}
-
-	log.V(2).Info("Reconciling JobSet")
 
 	// Get Jobs owned by JobSet.
 	ownedJobs, err := r.getChildJobs(ctx, js)
@@ -285,6 +293,17 @@ func (r *JobSetReconciler) getChildJobs(ctx context.Context, js *jobset.JobSet) 
 	ownedJobs := childJobs{}
 	for i, job := range childJobList.Items {
 		// Jobs with jobset.sigs.k8s.io/restart-attempt < restarts are marked for deletion.
+		parentReplicatedJob, exists := parentReplicatedJobName(&job)
+		pendingRestart := false
+		if !exists {
+			log.V(2).Info(fmt.Sprintf("The failed job %v does not appear to have a parent replicatedJob.", job.Name))
+		}
+		for _, replicatedJobStatus := range js.Status.ReplicatedJobsStatus {
+			if replicatedJobStatus.Name == parentReplicatedJob && replicatedJobStatus.PendingRestart {
+				pendingRestart = replicatedJobStatus.PendingRestart
+				break
+			}
+		}
 
 		jobRestarts, err := strconv.Atoi(job.Labels[constants.RestartsKey])
 		if err != nil {
@@ -292,7 +311,7 @@ func (r *JobSetReconciler) getChildJobs(ctx context.Context, js *jobset.JobSet) 
 			ownedJobs.previous = append(ownedJobs.previous, &childJobList.Items[i])
 			return nil, err
 		}
-		if int32(jobRestarts) < js.Status.Restarts {
+		if (int32(jobRestarts) < js.Status.Restarts) || pendingRestart {
 			log.V(2).Info("child Job marked for recreation as value of restarts label is less than target", "name", job.Name, constants.RestartsKey, jobRestarts, "target", js.Status.Restarts)
 			ownedJobs.previous = append(ownedJobs.previous, &childJobList.Items[i])
 			continue
@@ -332,12 +351,20 @@ func (r *JobSetReconciler) calculateReplicatedJobStatuses(ctx context.Context, j
 	// Prepare replicatedJobsReady for optimal iteration
 	replicatedJobsReady := map[string]map[string]int32{}
 	for _, replicatedJob := range js.Spec.ReplicatedJobs {
+		var numRestarts int32
+		for _, replicatedJobStatus := range js.Status.ReplicatedJobsStatus {
+			if replicatedJobStatus.Name == replicatedJob.Name {
+				numRestarts = replicatedJobStatus.Restarts
+				break
+			}
+		}
 		replicatedJobsReady[replicatedJob.Name] = map[string]int32{
 			"ready":     0,
 			"succeeded": 0,
 			"failed":    0,
 			"active":    0,
 			"suspended": 0,
+			"restarts":  numRestarts,
 		}
 	}
 
@@ -377,12 +404,14 @@ func (r *JobSetReconciler) calculateReplicatedJobStatuses(ctx context.Context, j
 	var rjStatus []jobset.ReplicatedJobStatus
 	for name, status := range replicatedJobsReady {
 		rjStatus = append(rjStatus, jobset.ReplicatedJobStatus{
-			Name:      name,
-			Ready:     status["ready"],
-			Succeeded: status["succeeded"],
-			Failed:    status["failed"],
-			Active:    status["active"],
-			Suspended: status["suspended"],
+			Name:           name,
+			Ready:          status["ready"],
+			Succeeded:      status["succeeded"],
+			Failed:         status["failed"],
+			Active:         status["active"],
+			Suspended:      status["suspended"],
+			Restarts:       status["restarts"],
+			PendingRestart: false,
 		})
 	}
 	return rjStatus
