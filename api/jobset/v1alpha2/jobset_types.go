@@ -211,6 +211,11 @@ type ReplicatedJobStatus struct {
 
 	// suspended is the number of child Jobs which are in a suspended state.
 	Suspended int32 `json:"suspended"`
+
+	// restarts tracks the number of child Jobs that have restarted.
+	Restarts int32 `json:"restarts"`
+
+	PendingRestart bool `json:"pendingRestart,omitempty"`
 }
 
 // +genclient
@@ -274,6 +279,11 @@ type ReplicatedJob struct {
 	// +listType=map
 	// +listMapKey=name
 	DependsOn []DependsOn `json:"dependsOn,omitempty"`
+
+	// backoffLimit tracks the number of replica restarts allowed before the ReplicatedJob fails.
+	// +optional
+	// +kubebuilder:default=1
+	BackoffLimit int32 `json:"backoffLimit,omitempty"`
 }
 
 // DependsOn defines the dependency on the previous ReplicatedJob status.
