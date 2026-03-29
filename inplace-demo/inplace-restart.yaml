@@ -1,0 +1,56 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: test-inplace
+spec:
+  replicatedJobs:
+    - name: workers
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          backoffLimit: 0
+          template:
+           spec:
+            shareProcessNamespace: true
+            containers:
+            - name: main
+              image: us-central1-docker.pkg.dev/imreddy-gke-dev/restart-agent/restart-image:latest
+              env:
+              - name: POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              securityContext:
+                  runAsUser: 0
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    add:
+                    - NET_BIND_SERVICE
+              volumeMounts:
+                - name: cri-sock-volume
+                  mountPath: /run/cri.sock
+                  readOnly: true
+                - name: containerd-sock-volume
+                  mountPath: /run/containerd/containerd.sock
+                  readOnly: true
+              command:
+              - bash
+              - -xc
+              - |
+                python3 /app/restart-handler.py
+            initContainers:
+            - name: wrapper
+              image: perl:5.34.0
+              restartPolicy: Always
+              command: ["/bin/sh"]
+              args: ["-c", "echo 'w';sleep 60s"]
+            restartPolicy: Never
+            volumes:
+            - name: cri-sock-volume
+              hostPath:
+                path: /run/containerd/containerd.sock
+                type: Socket
+            - name: containerd-sock-volume
+              hostPath:
+                path: /run/containerd/containerd.sock
